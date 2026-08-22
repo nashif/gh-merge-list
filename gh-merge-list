@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""gh merge-list: view and merge PRs from https://merge-list.zephyrproject.io
+
+Subcommands:
+  list   [--target T] [--status ready|waiting|blocked|all] [--mine] [--json]
+  show   NUMBER...
+  merge  [NUMBER...] [--target T] [--all] [--yes] [--dry-run] [--method M]
+  pick   [--target T]        interactive picker, then merge the selection
+
+Only "ready" PRs (all three merge gates green) are offered for merging.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.request
+from html.parser import HTMLParser
+
+URL = "https://merge-list.zephyrproject.io/index.html"
+REPO = "zephyrproject-rtos/zephyr"
+STATUS_ORDER = {"ready": 0, "waiting": 1, "blocked": 2}
+
+
+# --------------------------------------------------------------------------
+# merge-list scraping
+# --------------------------------------------------------------------------
+class MergeListParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_table = self.in_tbody = False
+        self.rows, self.row, self.cells, self.cell = [], None, None, None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "table" and a.get("id") == "pr-table":
+            self.in_table = True
+        elif not self.in_table:
+            return
+        elif tag == "tbody":
+            self.in_tbody = True
+        elif tag == "tr" and self.in_tbody:
+            self.row = {"status": a.get("data-status", "")}
+            self.cells = []
+        elif tag == "td" and self.cells is not None:
+            self.cell = {"text": [], "links": [], "tags": [], "gates": [],
+                         "in_tag": False}
+            self.cells.append(self.cell)
+        elif self.cell is not None:
+            if tag == "a" and a.get("href"):
+                self.cell["links"].append({"href": a["href"],
+                                           "text": a.get("title", "")})
+            elif tag == "span":
+                cls = a.get("class", "").split()
+                if "tag" in cls:
+                    self.cell["in_tag"] = True
+                    self.cell["tags"].append("")
+                elif "gate-icon" in cls:
+                    kind = next((c[5:] for c in cls if c.startswith("gate-")
+                                 and c not in ("gate-icon", "gate-pass",
+                                               "gate-fail", "gate-wait")), None)
+                    state = next((c[5:] for c in cls
+                                  if c in ("gate-pass", "gate-fail", "gate-wait")),
+                                 None)
+                    self.cell["gates"].append((kind, state))
+
+    def handle_endtag(self, tag):
+        if not self.in_table:
+            return
+        if tag == "table":
+            self.in_table = False
+        elif tag == "tbody":
+            self.in_tbody = False
+        elif tag == "span" and self.cell is not None and self.cell["in_tag"]:
+            self.cell["in_tag"] = False
+        elif tag == "td":
+            self.cell = None
+        elif tag == "tr" and self.row is not None:
+            self.finish_row()
+
+    def handle_data(self, data):
+        if self.cell is None:
+            return
+        if self.cell["in_tag"]:
+            self.cell["tags"][-1] += data
+        else:
+            self.cell["text"].append(data)
+
+    def finish_row(self):
+        c = self.cells
+        self.row, self.cells, cells = None, None, c
+        if len(cells) < 8:
+            return
+        text = lambda cell: " ".join("".join(cell["text"]).split())
+        handles = lambda cell: [l["text"] or l["href"].rstrip("/").rsplit("/", 1)[-1]
+                                for l in cell["links"]]
+        num = text(c[0])
+        self.rows.append({
+            "number": int(num) if num.isdigit() else num,
+            "url": c[0]["links"][0]["href"] if c[0]["links"] else None,
+            "title": text(c[1]),
+            "labels": [t.strip() for t in c[1]["tags"]],
+            "author": text(c[2]),
+            "assignees": handles(c[3]),
+            "approvers": handles(c[4]),
+            "target": text(c[5]),
+            "milestone": text(c[6]) or None,
+            "status": self.status_of(c[7]["gates"]),
+            "gates": dict(c[7]["gates"]),
+        })
+
+    @staticmethod
+    def status_of(gates):
+        states = dict(gates)
+        if "fail" in states.values():
+            return "blocked"
+        if "wait" in states.values():
+            return "waiting"
+        return "ready" if states else "unknown"
+
+
+def load_prs(url=URL):
+    req = urllib.request.Request(url, headers={"User-Agent": "gh-merge-list"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        html = r.read().decode("utf-8", errors="replace")
+    p = MergeListParser()
+    p.feed(html)
+    if not p.rows:
+        sys.exit("error: merge list table not found or empty")
+    return sorted(p.rows, key=lambda p: (STATUS_ORDER.get(p["status"], 9),
+                                         p["target"], p["number"]))
+
+
+# --------------------------------------------------------------------------
+# display helpers
+# --------------------------------------------------------------------------
+COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if COLOR else s
+
+
+STATUS_STYLE = {"ready": "32", "waiting": "33", "blocked": "31", "unknown": "2"}
+GATE_GLYPH = {"pass": c("32", "●"), "wait": c("33", "◐"), "fail": c("31", "○"), None: "?"}
+
+
+def gate_str(p):
+    return "".join(GATE_GLYPH.get(p["gates"].get(g)) for g in ("conflict", "approval", "review"))
+
+
+def term_width():
+    return shutil.get_terminal_size((120, 24)).columns
+
+
+def print_table(prs):
+    if not prs:
+        print("no pull requests match")
+        return
+    w = term_width()
+    tw = max(20, w - 7 - 9 - 4 - 14 - 16 - 8)
+    print(c("1", f"{'PR':>7}  {'STATUS':<8} {'GATES':<3} {'TARGET':<13} {'AUTHOR':<15} TITLE"))
+    for p in prs:
+        title = p["title"]
+        if p["labels"]:
+            title += " " + " ".join(c("36", f"[{l}]") for l in p["labels"])
+        if len(p["title"]) > tw:
+            title = p["title"][:tw - 1] + "…"
+        print(f"{p['number']:>7}  {c(STATUS_STYLE.get(p['status'], '0'), f'{p['status']:<8}')} "
+              f"{gate_str(p)} {p['target']:<13} {p['author'][:15]:<15} {title}")
+    counts = {}
+    for p in prs:
+        counts[p["status"]] = counts.get(p["status"], 0) + 1
+    print(c("2", f"\n{len(prs)} PRs: " + ", ".join(f"{v} {k}" for k, v in counts.items())
+            + "   gates: conflict-free / assignee approval / review time"))
+
+
+def print_detail(p):
+    print(c("1", f"#{p['number']} {p['title']}"))
+    print(f"  {p['url']}")
+    print(f"  status:    {c(STATUS_STYLE.get(p['status'], '0'), p['status'])}  {gate_str(p)}")
+    print(f"  target:    {p['target']}   milestone: {p['milestone'] or '-'}")
+    print(f"  author:    {p['author']}")
+    print(f"  assignees: {', '.join(p['assignees']) or '-'}")
+    print(f"  approvers: {', '.join(p['approvers']) or '-'}")
+    if p["labels"]:
+        print(f"  labels:    {', '.join(p['labels'])}")
+
+
+def gh_login():
+    r = subprocess.run(["gh", "api", "user", "-q", ".login"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def select(prs, target=None, status=None, mine=False, numbers=None):
+    out = prs
+    if target:
+        out = [p for p in out if p["target"] == target]
+    if status and status != "all":
+        out = [p for p in out if p["status"] == status]
+    if mine:
+        me = gh_login()
+        if not me:
+            sys.exit("error: cannot determine GitHub login (gh auth status?)")
+        out = [p for p in out if me in p["assignees"]]
+    if numbers:
+        want = set(numbers)
+        out = [p for p in out if p["number"] in want]
+        missing = want - {p["number"] for p in out}
+        if missing:
+            print(c("33", "warning: not on merge list: "
+                    + ", ".join(f"#{n}" for n in sorted(missing))), file=sys.stderr)
+    return out
+
+
+# --------------------------------------------------------------------------
+# merging
+# --------------------------------------------------------------------------
+def merge_prs(prs, method, yes, dry_run):
+    not_ready = [p for p in prs if p["status"] != "ready"]
+    if not_ready:
+        print(c("31", "refusing to merge PRs that are not ready: "
+                + ", ".join(f"#{p['number']} ({p['status']})" for p in not_ready)))
+        prs = [p for p in prs if p["status"] == "ready"]
+    if not prs:
+        sys.exit("nothing to merge")
+
+    print(c("1", f"About to merge {len(prs)} PR(s) into {REPO} (--{method}):"))
+    for p in prs:
+        print(f"  #{p['number']:<7} [{p['target']}] {p['title']}")
+    if dry_run:
+        print("\n(dry run) would run:")
+        for p in prs:
+            print(f"  gh pr merge {p['number']} --repo {REPO} --{method}")
+        return 0
+    if not yes:
+        ans = input("\nProceed? [y/N] ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("aborted")
+            return 1
+
+    failed = []
+    for p in prs:
+        n = p["number"]
+        print(f"\n{c('1', f'merging #{n}')} {p['title']}")
+        r = subprocess.run(["gh", "pr", "merge", str(n), "--repo", REPO, f"--{method}"],
+                           text=True)
+        if r.returncode:
+            failed.append(n)
+            print(c("31", f"  #{n} failed (exit {r.returncode})"))
+        else:
+            print(c("32", f"  #{n} merged"))
+    print(f"\n{len(prs) - len(failed)} merged, {len(failed)} failed"
+          + (": " + ", ".join(f"#{n}" for n in failed) if failed else ""))
+    return 1 if failed else 0
+
+
+def pick(prs):
+    """Interactive picker: fzf if available, else a numbered prompt."""
+    if not prs:
+        sys.exit("no ready PRs to pick from")
+    if shutil.which("fzf"):
+        lines = "\n".join(f"{p['number']:<7} [{p['target']}] {p['title']}" for p in prs)
+        r = subprocess.run(["fzf", "--multi", "--prompt", "merge> ",
+                            "--header", "TAB to select, ENTER to confirm"],
+                           input=lines, capture_output=True, text=True)
+        chosen = {int(l.split()[0]) for l in r.stdout.splitlines() if l.strip()}
+    else:
+        for i, p in enumerate(prs, 1):
+            print(f"{i:>3}) #{p['number']:<7} [{p['target']}] {p['title']}")
+        raw = input("\nselect (e.g. 1 3 5-7, or 'all'): ").strip()
+        idx = set()
+        if raw == "all":
+            idx = set(range(1, len(prs) + 1))
+        else:
+            for tok in raw.replace(",", " ").split():
+                if "-" in tok:
+                    a, b = tok.split("-", 1)
+                    idx.update(range(int(a), int(b) + 1))
+                elif tok.isdigit():
+                    idx.add(int(tok))
+        chosen = {prs[i - 1]["number"] for i in idx if 1 <= i <= len(prs)}
+    return [p for p in prs if p["number"] in chosen]
+
+
+# --------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(prog="gh merge-list",
+                                 description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--url", default=URL, help=argparse.SUPPRESS)
+    sub = ap.add_subparsers(dest="cmd")
+
+    def common(sp, status_default):
+        sp.add_argument("-t", "--target", help="only PRs targeting this branch")
+        sp.add_argument("-s", "--status", default=status_default,
+                        choices=["ready", "waiting", "blocked", "all"])
+        sp.add_argument("--mine", action="store_true", help="only PRs assigned to me")
+
+    sp = sub.add_parser("list", help="list PRs (default: ready)")
+    common(sp, "ready")
+    sp.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    sp.add_argument("-w", "--web", action="store_true", help="open the merge list in a browser")
+
+    sp = sub.add_parser("show", help="show details for PRs")
+    sp.add_argument("numbers", nargs="+", type=int)
+
+    sp = sub.add_parser("merge", help="merge ready PRs")
+    common(sp, "ready")
+    sp.add_argument("numbers", nargs="*", type=int, help="PR numbers (default: all ready matching filters with --all)")
+    sp.add_argument("--all", action="store_true", help="merge every ready PR matching the filters")
+    sp.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    sp.add_argument("-n", "--dry-run", action="store_true")
+    sp.add_argument("-m", "--method", default="rebase", choices=["rebase", "merge", "squash"])
+
+    sp = sub.add_parser("pick", help="interactively choose ready PRs to merge")
+    common(sp, "ready")
+    sp.add_argument("-y", "--yes", action="store_true")
+    sp.add_argument("-n", "--dry-run", action="store_true")
+    sp.add_argument("-m", "--method", default="rebase", choices=["rebase", "merge", "squash"])
+
+    args = ap.parse_args()
+    cmd = args.cmd or "list"
+    if cmd == "list" and getattr(args, "web", False):
+        subprocess.run(["gh", "browse", "https://merge-list.zephyrproject.io/"]
+                       if False else ["xdg-open", "https://merge-list.zephyrproject.io/"])
+        return 0
+
+    prs = load_prs(args.url)
+
+    if cmd == "list" or args.cmd is None:
+        sel = select(prs, getattr(args, "target", None), getattr(args, "status", "ready"),
+                     getattr(args, "mine", False))
+        if getattr(args, "json", False):
+            print(json.dumps(sel, indent=2))
+        else:
+            print_table(sel)
+        return 0
+
+    if cmd == "show":
+        sel = select(prs, numbers=args.numbers)
+        for i, p in enumerate(sel):
+            if i:
+                print()
+            print_detail(p)
+        return 0 if sel else 1
+
+    if cmd == "merge":
+        if not args.numbers and not args.all:
+            sys.exit("error: give PR numbers or --all (see also: gh merge-list pick)")
+        sel = select(prs, args.target, "all" if args.numbers else "ready",
+                     args.mine, args.numbers or None)
+        return merge_prs(sel, args.method, args.yes, args.dry_run)
+
+    if cmd == "pick":
+        sel = pick(select(prs, args.target, "ready", args.mine))
+        if not sel:
+            print("nothing selected")
+            return 1
+        return merge_prs(sel, args.method, args.yes, args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
