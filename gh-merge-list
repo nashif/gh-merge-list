@@ -324,8 +324,8 @@ def main():
     args = ap.parse_args()
     cmd = args.cmd or "list"
     if cmd == "list" and getattr(args, "web", False):
-        subprocess.run(["gh", "browse", "https://merge-list.zephyrproject.io/"]
-                       if False else ["xdg-open", "https://merge-list.zephyrproject.io/"])
+        import webbrowser
+        webbrowser.open("https://merge-list.zephyrproject.io/")
         return 0
 
     prs = load_prs(args.url)
