@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gh merge-list: view and merge PRs from https://merge-list.zephyrproject.io
+"""gh merge-list: view and merge PRs from the Zephyr merge list (merge_list.json)
 
 Subcommands:
   list   [--target T] [--status ready|waiting|blocked|all] [--mine] [--json]
@@ -17,120 +17,32 @@ import shutil
 import subprocess
 import sys
 import urllib.request
-from html.parser import HTMLParser
 
-URL = "https://merge-list.zephyrproject.io/index.html"
+URL = "https://merge-list.zephyrproject.io/merge_list.json"
 REPO = "zephyrproject-rtos/zephyr"
 STATUS_ORDER = {"ready": 0, "waiting": 1, "blocked": 2}
 
 
 # --------------------------------------------------------------------------
-# merge-list scraping
+# merge-list feed
 # --------------------------------------------------------------------------
-class MergeListParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.in_table = self.in_tbody = False
-        self.rows, self.row, self.cells, self.cell = [], None, None, None
-
-    def handle_starttag(self, tag, attrs):
-        a = dict(attrs)
-        if tag == "table" and a.get("id") == "pr-table":
-            self.in_table = True
-        elif not self.in_table:
-            return
-        elif tag == "tbody":
-            self.in_tbody = True
-        elif tag == "tr" and self.in_tbody:
-            self.row = {"status": a.get("data-status", "")}
-            self.cells = []
-        elif tag == "td" and self.cells is not None:
-            self.cell = {"text": [], "links": [], "tags": [], "gates": [],
-                         "in_tag": False}
-            self.cells.append(self.cell)
-        elif self.cell is not None:
-            if tag == "a" and a.get("href"):
-                self.cell["links"].append({"href": a["href"],
-                                           "text": a.get("title", "")})
-            elif tag == "span":
-                cls = a.get("class", "").split()
-                if "tag" in cls:
-                    self.cell["in_tag"] = True
-                    self.cell["tags"].append("")
-                elif "gate-icon" in cls:
-                    kind = next((c[5:] for c in cls if c.startswith("gate-")
-                                 and c not in ("gate-icon", "gate-pass",
-                                               "gate-fail", "gate-wait")), None)
-                    state = next((c[5:] for c in cls
-                                  if c in ("gate-pass", "gate-fail", "gate-wait")),
-                                 None)
-                    self.cell["gates"].append((kind, state))
-
-    def handle_endtag(self, tag):
-        if not self.in_table:
-            return
-        if tag == "table":
-            self.in_table = False
-        elif tag == "tbody":
-            self.in_tbody = False
-        elif tag == "span" and self.cell is not None and self.cell["in_tag"]:
-            self.cell["in_tag"] = False
-        elif tag == "td":
-            self.cell = None
-        elif tag == "tr" and self.row is not None:
-            self.finish_row()
-
-    def handle_data(self, data):
-        if self.cell is None:
-            return
-        if self.cell["in_tag"]:
-            self.cell["tags"][-1] += data
-        else:
-            self.cell["text"].append(data)
-
-    def finish_row(self):
-        c = self.cells
-        self.row, self.cells, cells = None, None, c
-        if len(cells) < 8:
-            return
-        text = lambda cell: " ".join("".join(cell["text"]).split())
-        handles = lambda cell: [l["text"] or l["href"].rstrip("/").rsplit("/", 1)[-1]
-                                for l in cell["links"]]
-        num = text(c[0])
-        self.rows.append({
-            "number": int(num) if num.isdigit() else num,
-            "url": c[0]["links"][0]["href"] if c[0]["links"] else None,
-            "title": text(c[1]),
-            "labels": [t.strip() for t in c[1]["tags"]],
-            "author": text(c[2]),
-            "assignees": handles(c[3]),
-            "approvers": handles(c[4]),
-            "target": text(c[5]),
-            "milestone": text(c[6]) or None,
-            "status": self.status_of(c[7]["gates"]),
-            "gates": dict(c[7]["gates"]),
-        })
-
-    @staticmethod
-    def status_of(gates):
-        states = dict(gates)
-        if "fail" in states.values():
-            return "blocked"
-        if "wait" in states.values():
-            return "waiting"
-        return "ready" if states else "unknown"
+def load_doc(url=URL):
+    req = urllib.request.Request(url, headers={"User-Agent": "gh-merge-list"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        doc = json.load(r)
+    if not isinstance(doc, dict) or "pull_requests" not in doc:
+        sys.exit("error: unexpected merge list format")
+    for p in doc["pull_requests"]:
+        p.setdefault("target", p.get("base"))          # older name used by callers
+        p.setdefault("labels", [])
+        p["head_sha"] = (p.get("head") or {}).get("sha")
+    doc["pull_requests"].sort(key=lambda p: (STATUS_ORDER.get(p["status"], 9),
+                                             p["target"] or "", p["number"]))
+    return doc
 
 
 def load_prs(url=URL):
-    req = urllib.request.Request(url, headers={"User-Agent": "gh-merge-list"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        html = r.read().decode("utf-8", errors="replace")
-    p = MergeListParser()
-    p.feed(html)
-    if not p.rows:
-        sys.exit("error: merge list table not found or empty")
-    return sorted(p.rows, key=lambda p: (STATUS_ORDER.get(p["status"], 9),
-                                         p["target"], p["number"]))
+    return load_doc(url)["pull_requests"]
 
 
 # --------------------------------------------------------------------------
@@ -148,14 +60,17 @@ GATE_GLYPH = {"pass": c("32", "●"), "wait": c("33", "◐"), "fail": c("31", "�
 
 
 def gate_str(p):
-    return "".join(GATE_GLYPH.get(p["gates"].get(g)) for g in ("conflict", "approval", "review"))
+    g = p.get("gates", {})
+    return "".join(GATE_GLYPH.get(g.get(k)) for k in ("conflict", "approval", "review_time"))
 
 
 def term_width():
     return shutil.get_terminal_size((120, 24)).columns
 
 
-def print_table(prs):
+def print_table(prs, doc=None):
+    if doc and doc.get("freeze_mode"):
+        print(c("33", "merge list is in FREEZE MODE: only hotfix PRs are ready"))
     if not prs:
         print("no pull requests match")
         return
@@ -187,6 +102,14 @@ def print_detail(p):
     print(f"  approvers: {', '.join(p['approvers']) or '-'}")
     if p["labels"]:
         print(f"  labels:    {', '.join(p['labels'])}")
+    if p.get("head_sha"):
+        h = p["head"]
+        print(f"  head:      {h.get('repo', '')}:{h.get('ref', '')} @ {p['head_sha'][:12]}")
+    if p.get("changed_files") is not None:
+        print(f"  size:      {p.get('commits', '?')} commits, {p.get('changed_files')} files, "
+              f"+{p.get('additions', 0)}/-{p.get('deletions', 0)}")
+    if p.get("hotfix"):
+        print(f"  hotfix:    yes")
 
 
 def gh_login():
@@ -328,7 +251,8 @@ def main():
         webbrowser.open("https://merge-list.zephyrproject.io/")
         return 0
 
-    prs = load_prs(args.url)
+    doc = load_doc(args.url)
+    prs = doc["pull_requests"]
 
     if cmd == "list" or args.cmd is None:
         sel = select(prs, getattr(args, "target", None), getattr(args, "status", "ready"),
@@ -336,7 +260,7 @@ def main():
         if getattr(args, "json", False):
             print(json.dumps(sel, indent=2))
         else:
-            print_table(sel)
+            print_table(sel, doc)
         return 0
 
     if cmd == "show":
