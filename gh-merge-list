@@ -9,7 +9,8 @@ Subcommands:
 
 Only "ready" PRs (all merge gates green) are offered for merging.  Before
 merging, each PR is re-checked live on GitHub and skipped if it is no longer
-open, has changes requested by a reviewer, or has failing or pending CI.
+open, has merge conflicts, has changes requested by a reviewer, or has failing
+or pending CI.
 """
 
 import argparse
@@ -157,6 +158,8 @@ def feed_problems(p):
     out = []
     if p["status"] != "ready":
         out.append(p["status"])
+    if p.get("gates", {}).get("conflict") == "fail" or p.get("mergeable_state") == "dirty":
+        out.append("merge conflicts")
     if p.get("gates", {}).get("ci") == "fail" or p.get("ci_state") not in (None, "SUCCESS"):
         out.append(f"CI {p.get('ci_state') or 'failing'}")
     return out
@@ -164,7 +167,7 @@ def feed_problems(p):
 
 def live_problems(number):
     """Re-check a PR on GitHub; return reasons it must not be merged (empty = ok)."""
-    fields = "state,isDraft,reviewDecision,statusCheckRollup"
+    fields = "state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup"
     r = subprocess.run(["gh", "pr", "view", str(number), "--repo", REPO, "--json", fields],
                        capture_output=True, text=True)
     if r.returncode:
@@ -175,6 +178,8 @@ def live_problems(number):
         out.append(v.get("state", "?").lower())
     if v.get("isDraft"):
         out.append("draft")
+    if v.get("mergeable") == "CONFLICTING" or v.get("mergeStateStatus") == "DIRTY":
+        out.append("merge conflicts")
     if v.get("reviewDecision") == "CHANGES_REQUESTED":
         out.append("changes requested")
     # the rollup keeps superseded runs (e.g. a cancelled run re-triggered by a
