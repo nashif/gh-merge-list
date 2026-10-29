@@ -7,7 +7,9 @@ Subcommands:
   merge  [NUMBER...] [--target T] [--all] [--yes] [--dry-run] [--method M]
   pick   [--target T]        interactive picker, then merge the selection
 
-Only "ready" PRs (all three merge gates green) are offered for merging.
+Only "ready" PRs (all merge gates green) are offered for merging.  Before
+merging, each PR is re-checked live on GitHub and skipped if it is no longer
+open, has changes requested by a reviewer, or has failing or pending CI.
 """
 
 import argparse
@@ -17,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 URL = "https://merge-list.zephyrproject.io/merge_list.json"
 REPO = "zephyrproject-rtos/zephyr"
@@ -61,7 +64,7 @@ GATE_GLYPH = {"pass": c("32", "●"), "wait": c("33", "◐"), "fail": c("31", "�
 
 def gate_str(p):
     g = p.get("gates", {})
-    return "".join(GATE_GLYPH.get(g.get(k)) for k in ("conflict", "approval", "review_time"))
+    return "".join(GATE_GLYPH.get(g.get(k)) for k in ("conflict", "ci", "approval", "review_time"))
 
 
 def term_width():
@@ -75,8 +78,8 @@ def print_table(prs, doc=None):
         print("no pull requests match")
         return
     w = term_width()
-    tw = max(20, w - 7 - 9 - 4 - 14 - 16 - 8)
-    print(c("1", f"{'PR':>7}  {'STATUS':<8} {'GATES':<3} {'TARGET':<13} {'AUTHOR':<15} TITLE"))
+    tw = max(20, w - 7 - 9 - 5 - 14 - 16 - 8)
+    print(c("1", f"{'PR':>7}  {'STATUS':<8} {'GATES':<4} {'TARGET':<13} {'AUTHOR':<15} TITLE"))
     for p in prs:
         title = p["title"]
         if p["labels"]:
@@ -89,7 +92,7 @@ def print_table(prs, doc=None):
     for p in prs:
         counts[p["status"]] = counts.get(p["status"], 0) + 1
     print(c("2", f"\n{len(prs)} PRs: " + ", ".join(f"{v} {k}" for k, v in counts.items())
-            + "   gates: conflict-free / assignee approval / review time"))
+            + "   gates: conflict-free / CI / assignee approval / review time"))
 
 
 def print_detail(p):
@@ -100,6 +103,8 @@ def print_detail(p):
     print(f"  author:    {p['author']}")
     print(f"  assignees: {', '.join(p['assignees']) or '-'}")
     print(f"  approvers: {', '.join(p['approvers']) or '-'}")
+    if p.get("ci_state"):
+        print(f"  ci:        {p['ci_state']}")
     if p["labels"]:
         print(f"  labels:    {', '.join(p['labels'])}")
     if p.get("head_sha"):
@@ -141,12 +146,79 @@ def select(prs, target=None, status=None, mine=False, numbers=None):
 # --------------------------------------------------------------------------
 # merging
 # --------------------------------------------------------------------------
+# check conclusions / legacy status-context states that mean CI is not green
+CHECK_FAILED = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE",
+                "ERROR"}
+CHECK_IGNORED = {"SUCCESS", "SKIPPED", "NEUTRAL"}
+
+
+def feed_problems(p):
+    """Reasons from the merge-list feed itself why a PR must not be merged."""
+    out = []
+    if p["status"] != "ready":
+        out.append(p["status"])
+    if p.get("gates", {}).get("ci") == "fail" or p.get("ci_state") not in (None, "SUCCESS"):
+        out.append(f"CI {p.get('ci_state') or 'failing'}")
+    return out
+
+
+def live_problems(number):
+    """Re-check a PR on GitHub; return reasons it must not be merged (empty = ok)."""
+    fields = "state,isDraft,reviewDecision,statusCheckRollup"
+    r = subprocess.run(["gh", "pr", "view", str(number), "--repo", REPO, "--json", fields],
+                       capture_output=True, text=True)
+    if r.returncode:
+        return [f"gh pr view failed: {r.stderr.strip() or r.returncode}"]
+    v = json.loads(r.stdout)
+    out = []
+    if v.get("state") != "OPEN":
+        out.append(v.get("state", "?").lower())
+    if v.get("isDraft"):
+        out.append("draft")
+    if v.get("reviewDecision") == "CHANGES_REQUESTED":
+        out.append("changes requested")
+    # the rollup keeps superseded runs (e.g. a cancelled run re-triggered by a
+    # push), so only the most recent run of each check counts
+    latest = {}
+    for chk in v.get("statusCheckRollup") or []:
+        name = chk.get("name") or chk.get("context") or "?"
+        started = chk.get("startedAt") or chk.get("createdAt") or ""
+        if name not in latest or started >= latest[name][0]:
+            latest[name] = (started, chk.get("conclusion") or chk.get("state"))
+    failed = sorted(n for n, (_, verdict) in latest.items() if verdict in CHECK_FAILED)
+    pending = [n for n, (_, verdict) in latest.items()
+               if verdict not in CHECK_FAILED and verdict not in CHECK_IGNORED]
+    if failed:
+        out.append(f"CI failed ({', '.join(failed[:3])})")
+    if pending:
+        out.append(f"CI pending ({len(pending)})")
+    return out
+
+
+def check_mergeable(prs):
+    """Drop PRs that are not mergeable according to the feed and a live GitHub check."""
+    blocked = {}
+    for p in prs:
+        why = feed_problems(p)
+        if why:
+            blocked[p["number"]] = why
+    candidates = [p for p in prs if p["number"] not in blocked]
+    if candidates:
+        print(c("2", f"re-checking {len(candidates)} PR(s) on GitHub..."), file=sys.stderr)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for p, why in zip(candidates, ex.map(live_problems, [p["number"] for p in candidates])):
+                if why:
+                    blocked[p["number"]] = why
+    if blocked:
+        print(c("31", "refusing to merge:"))
+        for p in prs:
+            if p["number"] in blocked:
+                print(c("31", f"  #{p['number']:<7} {'; '.join(blocked[p['number']])}"))
+    return [p for p in prs if p["number"] not in blocked]
+
+
 def merge_prs(prs, method, yes, dry_run):
-    not_ready = [p for p in prs if p["status"] != "ready"]
-    if not_ready:
-        print(c("31", "refusing to merge PRs that are not ready: "
-                + ", ".join(f"#{p['number']} ({p['status']})" for p in not_ready)))
-        prs = [p for p in prs if p["status"] == "ready"]
+    prs = check_mergeable(prs)
     if not prs:
         sys.exit("nothing to merge")
 

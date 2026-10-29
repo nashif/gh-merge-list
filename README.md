@@ -27,3 +27,7 @@ interactive picker when available.
 
 Merges go through `gh pr merge --rebase` (change with `--method`). PRs whose
 merge gates are not all green are never merged, even if named explicitly.
+
+The merge list is a periodic snapshot, so every PR is re-checked live on
+GitHub right before merging and skipped if it is no longer open, is a draft,
+has changes requested by a reviewer, or has failing or still-running CI.
