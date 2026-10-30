@@ -16,6 +16,7 @@ or pending CI.
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -165,6 +166,11 @@ def feed_problems(p):
     return out
 
 
+def workflow_run_id(chk):
+    m = re.search(r"/actions/runs/(\d+)", chk.get("detailsUrl") or "")
+    return int(m.group(1)) if m else None
+
+
 def live_problems(number):
     """Re-check a PR on GitHub; return reasons it must not be merged (empty = ok)."""
     fields = "state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup"
@@ -182,10 +188,21 @@ def live_problems(number):
         out.append("merge conflicts")
     if v.get("reviewDecision") == "CHANGES_REQUESTED":
         out.append("changes requested")
-    # the rollup keeps superseded runs (e.g. a cancelled run re-triggered by a
-    # push), so only the most recent run of each check counts
+    # the rollup keeps superseded workflow runs (e.g. a run cancelled by a
+    # new push), and matrix jobs may be named differently between runs, so
+    # only jobs from the newest run of each workflow count; within that, only
+    # the most recent attempt of each job
+    rollup = v.get("statusCheckRollup") or []
+    newest_run = {}
+    for chk in rollup:
+        wf, run = chk.get("workflowName"), workflow_run_id(chk)
+        if wf and run:
+            newest_run[wf] = max(newest_run.get(wf, 0), run)
     latest = {}
-    for chk in v.get("statusCheckRollup") or []:
+    for chk in rollup:
+        wf, run = chk.get("workflowName"), workflow_run_id(chk)
+        if wf and run and run != newest_run[wf]:
+            continue
         name = chk.get("name") or chk.get("context") or "?"
         started = chk.get("startedAt") or chk.get("createdAt") or ""
         if name not in latest or started >= latest[name][0]:
