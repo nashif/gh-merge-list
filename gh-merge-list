@@ -258,10 +258,17 @@ def merge_prs(prs, method, yes, dry_run):
             print("aborted")
             return 1
 
-    failed = []
+    failed, skipped = [], []
     for p in prs:
         n = p["number"]
         print(f"\n{c('1', f'merging #{n}')} {p['title']}")
+        # re-check immediately before merging: state may have changed since the
+        # up-front check while earlier PRs in the queue were being merged
+        why = live_problems(n)
+        if why:
+            skipped.append(n)
+            print(c("31", f"  #{n} skipped: {'; '.join(why)}"))
+            continue
         r = subprocess.run(["gh", "pr", "merge", str(n), "--repo", REPO, f"--{method}"],
                            text=True)
         if r.returncode:
@@ -269,9 +276,11 @@ def merge_prs(prs, method, yes, dry_run):
             print(c("31", f"  #{n} failed (exit {r.returncode})"))
         else:
             print(c("32", f"  #{n} merged"))
-    print(f"\n{len(prs) - len(failed)} merged, {len(failed)} failed"
-          + (": " + ", ".join(f"#{n}" for n in failed) if failed else ""))
-    return 1 if failed else 0
+    print(f"\n{len(prs) - len(failed) - len(skipped)} merged, {len(failed)} failed"
+          + (": " + ", ".join(f"#{n}" for n in failed) if failed else "")
+          + f", {len(skipped)} skipped"
+          + (": " + ", ".join(f"#{n}" for n in skipped) if skipped else ""))
+    return 1 if failed or skipped else 0
 
 
 def pick(prs):
