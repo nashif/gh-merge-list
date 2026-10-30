@@ -6,6 +6,9 @@ Subcommands:
   show   NUMBER...
   merge  [NUMBER...] [--target T] [--all] [--yes] [--dry-run] [--method M]
   pick   [--target T]        interactive picker, then merge the selection
+  train  [PATH] [--yes] [--dry-run] [--method M]
+                             merge the PRs of a merge train (.merge-train.json)
+                             that are still ready and unchanged on the live list
 
 Only "ready" PRs (all merge gates green) are offered for merging.  Before
 merging, each PR is re-checked live on GitHub and skipped if it is no longer
@@ -171,9 +174,11 @@ def workflow_run_id(chk):
     return int(m.group(1)) if m else None
 
 
-def live_problems(number):
-    """Re-check a PR on GitHub; return reasons it must not be merged (empty = ok)."""
-    fields = "state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup"
+def live_problems(number, head_sha=None):
+    """Re-check a PR on GitHub; return reasons it must not be merged (empty = ok).
+
+    If head_sha is given, the PR must still be at that commit."""
+    fields = "state,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,headRefOid"
     r = subprocess.run(["gh", "pr", "view", str(number), "--repo", REPO, "--json", fields],
                        capture_output=True, text=True)
     if r.returncode:
@@ -184,6 +189,8 @@ def live_problems(number):
         out.append(v.get("state", "?").lower())
     if v.get("isDraft"):
         out.append("draft")
+    if head_sha and v.get("headRefOid") != head_sha:
+        out.append(f"head moved {head_sha[:10]} -> {(v.get('headRefOid') or '?')[:10]}")
     if v.get("mergeable") == "CONFLICTING" or v.get("mergeStateStatus") == "DIRTY":
         out.append("merge conflicts")
     if v.get("reviewDecision") == "CHANGES_REQUESTED":
@@ -226,9 +233,11 @@ def check_mergeable(prs):
             blocked[p["number"]] = why
     candidates = [p for p in prs if p["number"] not in blocked]
     if candidates:
+        sys.stdout.flush()
         print(c("2", f"re-checking {len(candidates)} PR(s) on GitHub..."), file=sys.stderr)
         with ThreadPoolExecutor(max_workers=8) as ex:
-            for p, why in zip(candidates, ex.map(live_problems, [p["number"] for p in candidates])):
+            for p, why in zip(candidates, ex.map(live_problems, [p["number"] for p in candidates],
+                                                 [p.get("expect_sha") for p in candidates])):
                 if why:
                     blocked[p["number"]] = why
     if blocked:
@@ -264,7 +273,7 @@ def merge_prs(prs, method, yes, dry_run):
         print(f"\n{c('1', f'merging #{n}')} {p['title']}")
         # re-check immediately before merging: state may have changed since the
         # up-front check while earlier PRs in the queue were being merged
-        why = live_problems(n)
+        why = live_problems(n, p.get("expect_sha"))
         if why:
             skipped.append(n)
             print(c("31", f"  #{n} skipped: {'; '.join(why)}"))
@@ -281,6 +290,82 @@ def merge_prs(prs, method, yes, dry_run):
           + f", {len(skipped)} skipped"
           + (": " + ", ".join(f"#{n}" for n in skipped) if skipped else ""))
     return 1 if failed or skipped else 0
+
+
+# --------------------------------------------------------------------------
+# merge train
+# --------------------------------------------------------------------------
+TRAIN_FILE = ".merge-train.json"
+
+
+def load_train(path):
+    if os.path.isdir(path):
+        path = os.path.join(path, TRAIN_FILE)
+    try:
+        with open(path) as f:
+            t = json.load(f)
+    except OSError as e:
+        sys.exit(f"error: cannot read merge train: {e}")
+    if not isinstance(t, dict) or t.get("schema") != 1 or "pull_requests" not in t:
+        sys.exit(f"error: {path}: not a merge train file (schema 1)")
+    return t
+
+
+def train_prs(train, live):
+    """PRs merged into the train that are still ready and unchanged on the live list."""
+    by_num = {p["number"]: p for p in live}
+    out, dropped = [], []
+    for tp in train["pull_requests"]:
+        n = tp["number"]
+        sha = tp.get("fetched_sha") or tp.get("head_sha")
+        if tp.get("result") != "merged":
+            dropped.append((n, f"{tp.get('result') or 'not merged'} in train"))
+            continue
+        lp = by_num.get(n)
+        if lp is None:
+            dropped.append((n, "no longer on the merge list"))
+            continue
+        if lp["status"] != "ready":
+            dropped.append((n, f"now {lp['status']} on the merge list"))
+            continue
+        if lp["target"] != train["target"]:
+            dropped.append((n, f"target changed to {lp['target']}"))
+            continue
+        if lp.get("head_sha") != sha:
+            dropped.append((n, f"head moved {sha[:10]} -> {(lp.get('head_sha') or '?')[:10]}"))
+            continue
+        p = dict(lp)
+        p["expect_sha"] = sha
+        out.append(p)
+    return out, dropped
+
+
+def print_train(train, prs, dropped, live, live_doc):
+    print(c("1", f"merge train {train['branch']} -> {train['target']}")
+          + c("2", f"  (created {train['created_at']}, train status: {train['status']})"))
+    print(c("2", f"  merge list: train {train['merge_list'].get('updated')}, "
+            f"live {live_doc.get('updated')}"))
+    base = upstream_sha(train["target"])
+    if base and base != train["base"]:
+        print(c("33", f"  note: {train['target']} moved since the train was built "
+                f"({train['base'][:10]} -> {base[:10]})"))
+    if dropped:
+        print(c("33", "  not merging:"))
+        for n, why in dropped:
+            print(c("33", f"    #{n:<7} {why}"))
+    extra = sorted(p["number"] for p in live
+                   if p["status"] == "ready" and p["target"] == train["target"]
+                   and p["number"] not in {tp["number"] for tp in train["pull_requests"]})
+    if extra:
+        print(c("2", f"  ready on the live list but not in the train: "
+                + ", ".join(f"#{n}" for n in extra)))
+    print()
+
+
+def upstream_sha(branch):
+    r = subprocess.run(["gh", "api", f"repos/{REPO}/branches/{branch}", "-q", ".commit.sha"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
 
 
 def pick(prs):
@@ -347,6 +432,13 @@ def main():
     sp.add_argument("-n", "--dry-run", action="store_true")
     sp.add_argument("-m", "--method", default="rebase", choices=["rebase", "merge", "squash"])
 
+    sp = sub.add_parser("train", help="merge the PRs of a merge train that are still ready")
+    sp.add_argument("path", nargs="?", default=TRAIN_FILE,
+                    help=f"merge train file or the checkout containing it (default: ./{TRAIN_FILE})")
+    sp.add_argument("-y", "--yes", action="store_true")
+    sp.add_argument("-n", "--dry-run", action="store_true")
+    sp.add_argument("-m", "--method", default="rebase", choices=["rebase", "merge", "squash"])
+
     args = ap.parse_args()
     cmd = args.cmd or "list"
     if cmd == "list" and getattr(args, "web", False):
@@ -379,6 +471,14 @@ def main():
             sys.exit("error: give PR numbers or --all (see also: gh merge-list pick)")
         sel = select(prs, args.target, "all" if args.numbers else "ready",
                      args.mine, args.numbers or None)
+        return merge_prs(sel, args.method, args.yes, args.dry_run)
+
+    if cmd == "train":
+        train = load_train(args.path)
+        sel, dropped = train_prs(train, prs)
+        print_train(train, sel, dropped, prs, doc)
+        if not sel:
+            sys.exit("nothing to merge")
         return merge_prs(sel, args.method, args.yes, args.dry_run)
 
     if cmd == "pick":

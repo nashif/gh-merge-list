@@ -25,6 +25,19 @@ interactive picker when available.
     gh merge-list merge ... -n          # dry run
     gh merge-list pick                  # choose PRs interactively, then merge
 
+### Merge trains
+
+    gh merge-list train ~/zephyrproject/zephyr   # checkout holding .merge-train.json
+    gh merge-list train path/to/.merge-train.json -n
+
+`train` merges the PRs that were successfully merged into an integration
+branch built by the merge train tool (recorded in `.merge-train.json`). The
+live merge list is fetched again and a train PR is only merged if it is still
+on the list, still `ready`, still targets the train's branch and its head
+commit has not moved since the train was built. PRs that failed in the train
+are never merged; PRs that became ready after the train was built are listed
+but left alone.
+
 Merges go through `gh pr merge --rebase` (change with `--method`). PRs whose
 merge gates are not all green are never merged, even if named explicitly.
 
